@@ -26,6 +26,44 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
+class RMSNorm(nn.Module):
+    """RMSNorm used by many modern LLMs, with an optional bias for config symmetry."""
+
+    def __init__(self, ndim, bias):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(ndim))
+        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+
+    def forward(self, input):
+        output = input * torch.rsqrt(input.pow(2).mean(-1, keepdim=True) + 1e-5)
+        output = output * self.weight
+        if self.bias is not None:
+            output = output + self.bias
+        return output
+
+def build_norm(config):
+    if config.norm_type == 'layernorm':
+        return LayerNorm(config.n_embd, bias=config.bias)
+    if config.norm_type == 'rmsnorm':
+        return RMSNorm(config.n_embd, bias=config.bias)
+    raise ValueError(f"unknown norm_type: {config.norm_type}")
+
+def apply_rope(q, k, inv_freq):
+    T = q.size(-2)
+    pos = torch.arange(T, device=q.device, dtype=inv_freq.dtype)
+    freqs = torch.outer(pos, inv_freq)
+    cos = freqs.cos().to(dtype=q.dtype)[None, None, :, :]
+    sin = freqs.sin().to(dtype=q.dtype)[None, None, :, :]
+
+    def rotate(x):
+        x_even = x[..., ::2]
+        x_odd = x[..., 1::2]
+        x_rotated = torch.stack((x_even * cos - x_odd * sin,
+                                 x_even * sin + x_odd * cos), dim=-1)
+        return x_rotated.flatten(-2)
+
+    return rotate(q), rotate(k)
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -41,6 +79,14 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        self.position_embedding_type = config.position_embedding_type
+        if self.position_embedding_type == 'rope':
+            head_dim = config.n_embd // config.n_head
+            assert head_dim % 2 == 0, "RoPE requires an even head dimension"
+            inv_freq = 1.0 / (config.rope_base ** (torch.arange(0, head_dim, 2).float() / head_dim))
+            self.register_buffer("rope_inv_freq", inv_freq, persistent=False)
+        elif self.position_embedding_type != 'learned':
+            raise ValueError(f"unknown position_embedding_type: {self.position_embedding_type}")
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
@@ -57,6 +103,8 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        if self.position_embedding_type == 'rope':
+            q, k = apply_rope(q, k, self.rope_inv_freq)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -91,14 +139,37 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
+class SwiGLUMLP(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        hidden_dim = int(config.swiglu_hidden_mult * config.n_embd)
+        self.c_fc = nn.Linear(config.n_embd, 2 * hidden_dim, bias=config.bias)
+        self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=config.bias)
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x):
+        x, gate = self.c_fc(x).chunk(2, dim=-1)
+        x = x * F.silu(gate)
+        x = self.c_proj(x)
+        x = self.dropout(x)
+        return x
+
+def build_mlp(config):
+    if config.mlp_type == 'gelu':
+        return MLP(config)
+    if config.mlp_type == 'swiglu':
+        return SwiGLUMLP(config)
+    raise ValueError(f"unknown mlp_type: {config.mlp_type}")
+
 class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_1 = build_norm(config)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
+        self.ln_2 = build_norm(config)
+        self.mlp = build_mlp(config)
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
@@ -114,6 +185,11 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    norm_type: str = 'layernorm' # 'layernorm' or 'rmsnorm'
+    mlp_type: str = 'gelu' # 'gelu' or 'swiglu'
+    position_embedding_type: str = 'learned' # 'learned' or 'rope'
+    rope_base: float = 10000.0
+    swiglu_hidden_mult: float = 8/3
 
 class GPT(nn.Module):
 
@@ -123,13 +199,15 @@ class GPT(nn.Module):
         assert config.block_size is not None
         self.config = config
 
-        self.transformer = nn.ModuleDict(dict(
+        transformer = dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
-        ))
+            ln_f = build_norm(config),
+        )
+        if config.position_embedding_type == 'learned':
+            transformer['wpe'] = nn.Embedding(config.block_size, config.n_embd)
+        self.transformer = nn.ModuleDict(transformer)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
@@ -155,7 +233,7 @@ class GPT(nn.Module):
         params are actually used as weights in the final layer, so we include them.
         """
         n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
+        if non_embedding and hasattr(self.transformer, 'wpe'):
             n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
@@ -175,8 +253,11 @@ class GPT(nn.Module):
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        if self.config.position_embedding_type == 'learned':
+            pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+            x = self.transformer.drop(tok_emb + pos_emb)
+        else:
+            x = self.transformer.drop(tok_emb)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
@@ -198,7 +279,8 @@ class GPT(nn.Module):
         # but want to use a smaller block size for some smaller, simpler model
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+        if hasattr(self.transformer, 'wpe'):
+            self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
         for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
