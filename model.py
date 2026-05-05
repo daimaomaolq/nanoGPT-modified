@@ -48,9 +48,9 @@ def build_norm(config):
         return RMSNorm(config.n_embd, bias=config.bias)
     raise ValueError(f"unknown norm_type: {config.norm_type}")
 
-def apply_rope(q, k, inv_freq):
+def apply_rope(q, k, inv_freq, pos_offset=0):
     T = q.size(-2)
-    pos = torch.arange(T, device=q.device, dtype=inv_freq.dtype)
+    pos = torch.arange(pos_offset, pos_offset + T, device=q.device, dtype=inv_freq.dtype)
     freqs = torch.outer(pos, inv_freq)
     cos = freqs.cos().to(dtype=q.dtype)[None, None, :, :]
     sin = freqs.sin().to(dtype=q.dtype)[None, None, :, :]
@@ -95,7 +95,7 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x):
+    def forward(self, x, past_kv=None, use_cache=False, pos_offset=0):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -104,16 +104,23 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         if self.position_embedding_type == 'rope':
-            q, k = apply_rope(q, k, self.rope_inv_freq)
+            q, k = apply_rope(q, k, self.rope_inv_freq, pos_offset=pos_offset)
+        if past_kv is not None:
+            past_k, past_v = past_kv
+            k = torch.cat((past_k, k), dim=-2)
+            v = torch.cat((past_v, v), dim=-2)
+        present_kv = (k, v) if use_cache else None
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            is_causal = past_kv is None
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=is_causal)
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            past_len = k.size(-2) - T
+            att = att.masked_fill(self.bias[:,:,past_len:past_len+T,:past_len+T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
@@ -121,6 +128,8 @@ class CausalSelfAttention(nn.Module):
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
+        if use_cache:
+            return y, present_kv
         return y
 
 class MLP(nn.Module):
@@ -171,9 +180,16 @@ class Block(nn.Module):
         self.ln_2 = build_norm(config)
         self.mlp = build_mlp(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, past_kv=None, use_cache=False, pos_offset=0):
+        if use_cache:
+            attn_out, present_kv = self.attn(self.ln_1(x), past_kv=past_kv, use_cache=True, pos_offset=pos_offset)
+        else:
+            attn_out = self.attn(self.ln_1(x), pos_offset=pos_offset)
+            present_kv = None
+        x = x + attn_out
         x = x + self.mlp(self.ln_2(x))
+        if use_cache:
+            return x, present_kv
         return x
 
 @dataclass
@@ -245,11 +261,12 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, past_kv=None, use_cache=False):
         device = idx.device
         b, t = idx.size()
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        past_len = 0 if past_kv is None else past_kv[0][0].size(-2)
+        assert past_len + t <= self.config.block_size, f"Cannot forward sequence of length {past_len + t}, block size is only {self.config.block_size}"
+        pos = torch.arange(past_len, past_len + t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
@@ -258,8 +275,15 @@ class GPT(nn.Module):
             x = self.transformer.drop(tok_emb + pos_emb)
         else:
             x = self.transformer.drop(tok_emb)
-        for block in self.transformer.h:
-            x = block(x)
+        presents = [] if use_cache else None
+        if past_kv is None:
+            past_kv = [None] * len(self.transformer.h)
+        for block, layer_past in zip(self.transformer.h, past_kv):
+            if use_cache:
+                x, present = block(x, past_kv=layer_past, use_cache=True, pos_offset=past_len)
+                presents.append(present)
+            else:
+                x = block(x)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -271,6 +295,8 @@ class GPT(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
+        if use_cache:
+            return logits, loss, presents
         return logits, loss
 
     def crop_block_size(self, block_size):
@@ -385,12 +411,15 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, use_kv_cache=False):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
+        if use_kv_cache:
+            return self._generate_with_kv_cache(idx, max_new_tokens, temperature=temperature, top_k=top_k)
+
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
@@ -408,5 +437,29 @@ class GPT(nn.Module):
             idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
+
+        return idx
+
+    @torch.no_grad()
+    def _generate_with_kv_cache(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+        if idx.size(1) > self.config.block_size:
+            idx = idx[:, -self.config.block_size:]
+
+        logits, _, past_kv = self(idx, use_cache=True)
+        for _ in range(max_new_tokens):
+            logits = logits[:, -1, :] / temperature
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+
+            if past_kv[0][0].size(-2) >= self.config.block_size:
+                idx = torch.cat((idx, idx_next), dim=1)
+                idx_cond = idx[:, -self.config.block_size:]
+                logits, _, past_kv = self(idx_cond, use_cache=True)
+            else:
+                logits, _, past_kv = self(idx_next, past_kv=past_kv, use_cache=True)
+                idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
