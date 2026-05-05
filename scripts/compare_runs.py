@@ -106,7 +106,7 @@ def write_summary(out_dir, baseline_name, candidate_name, baseline, candidate):
         md.append(f"| {name} | {base_str} | {cand_str} | {change} |\n")
 
     md.append("\n## Notes\n")
-    md.append("- `final_val_loss` is the most important quality metric for this Shakespeare char experiment.\n")
+    md.append("- `final_val_loss` is the most important quality metric for this language modeling experiment.\n")
     md.append("- `avg_tail_iter_time_ms`, `avg_tail_mfu_percent`, and `avg_tail_tokens_per_sec` are averaged over the tail of training logs after warmup.\n")
     md.append("- Generated samples are useful for qualitative inspection, but should not be treated as the primary metric.\n")
     (out_dir / "summary.md").write_text("".join(md), encoding="utf-8")
@@ -140,6 +140,43 @@ def plot_losses(out_dir, baseline_name, candidate_name, baseline, candidate):
     plt.tight_layout()
     plt.savefig(out_dir / "loss_curves.png", dpi=180)
     plt.close()
+
+    zoom_min_step = 1000
+    plt.figure(figsize=(8, 5))
+    for name, metrics in [(baseline_name, baseline), (candidate_name, candidate)]:
+        rows = [row for row in metrics["eval"] if row["step"] >= zoom_min_step]
+        if not rows:
+            continue
+        steps = [row["step"] for row in rows]
+        val_loss = [row["val_loss"] for row in rows]
+        plt.plot(steps, val_loss, marker="o", label=f"{name} val")
+    plt.xlabel("step")
+    plt.ylabel("val loss")
+    plt.title(f"Validation loss zoom (step >= {zoom_min_step})")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_dir / "val_loss_zoom.png", dpi=180)
+    plt.close()
+
+    base_by_step = {row["step"]: row for row in baseline["eval"]}
+    cand_by_step = {row["step"]: row for row in candidate["eval"]}
+    common_steps = sorted(set(base_by_step) & set(cand_by_step))
+    if common_steps:
+        val_delta = [cand_by_step[step]["val_loss"] - base_by_step[step]["val_loss"] for step in common_steps]
+        train_delta = [cand_by_step[step]["train_loss"] - base_by_step[step]["train_loss"] for step in common_steps]
+        plt.figure(figsize=(8, 5))
+        plt.axhline(0.0, color="black", linewidth=1)
+        plt.plot(common_steps, train_delta, marker="o", linestyle="--", label="train delta")
+        plt.plot(common_steps, val_delta, marker="o", label="val delta")
+        plt.xlabel("step")
+        plt.ylabel("candidate loss - baseline loss")
+        plt.title("Loss delta (negative means candidate is better)")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(out_dir / "loss_delta.png", dpi=180)
+        plt.close()
 
     plt.figure(figsize=(8, 5))
     for name, metrics in [(baseline_name, baseline), (candidate_name, candidate)]:
