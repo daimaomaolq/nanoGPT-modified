@@ -49,6 +49,31 @@ def parse_log(path):
     return metrics
 
 
+def parse_logs(paths):
+    merged = {
+        "path": [str(path) for path in paths],
+        "params_m": None,
+        "tokens_per_iter": None,
+        "eval": [],
+        "iter": [],
+    }
+    for path in paths:
+        metrics = parse_log(path)
+        if merged["params_m"] is None and metrics["params_m"] is not None:
+            merged["params_m"] = metrics["params_m"]
+        if merged["tokens_per_iter"] is None and metrics["tokens_per_iter"] is not None:
+            merged["tokens_per_iter"] = metrics["tokens_per_iter"]
+        merged["eval"].extend(metrics["eval"])
+        merged["iter"].extend(metrics["iter"])
+
+    # Resume logs can overlap at the boundary. Keep the last record for each step/iter.
+    eval_by_step = {row["step"]: row for row in merged["eval"]}
+    iter_by_step = {row["iter"]: row for row in merged["iter"]}
+    merged["eval"] = [eval_by_step[step] for step in sorted(eval_by_step)]
+    merged["iter"] = [iter_by_step[step] for step in sorted(iter_by_step)]
+    return merged
+
+
 def last_eval(metrics):
     return metrics["eval"][-1] if metrics["eval"] else None
 
@@ -141,6 +166,24 @@ def plot_losses(out_dir, baseline_name, candidate_name, baseline, candidate):
     plt.savefig(out_dir / "loss_curves.png", dpi=180)
     plt.close()
 
+    plt.figure(figsize=(8, 5))
+    for name, metrics in [(baseline_name, baseline), (candidate_name, candidate)]:
+        if not metrics["eval"]:
+            continue
+        steps = [row["step"] for row in metrics["eval"]]
+        train_loss = [row["train_loss"] for row in metrics["eval"]]
+        val_loss = [row["val_loss"] for row in metrics["eval"]]
+        plt.semilogy(steps, train_loss, linestyle="--", label=f"{name} train")
+        plt.semilogy(steps, val_loss, label=f"{name} val")
+    plt.xlabel("step")
+    plt.ylabel("loss (log scale)")
+    plt.title(f"Training curves, log scale: {candidate_name} vs {baseline_name}")
+    plt.grid(True, which="both", alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_dir / "loss_curves_log.png", dpi=180)
+    plt.close()
+
     zoom_min_step = 1000
     plt.figure(figsize=(8, 5))
     for name, metrics in [(baseline_name, baseline), (candidate_name, candidate)]:
@@ -161,7 +204,8 @@ def plot_losses(out_dir, baseline_name, candidate_name, baseline, candidate):
 
     base_by_step = {row["step"]: row for row in baseline["eval"]}
     cand_by_step = {row["step"]: row for row in candidate["eval"]}
-    common_steps = sorted(set(base_by_step) & set(cand_by_step))
+    delta_min_step = 2500
+    common_steps = sorted(step for step in set(base_by_step) & set(cand_by_step) if step >= delta_min_step)
     if common_steps:
         val_delta = [cand_by_step[step]["val_loss"] - base_by_step[step]["val_loss"] for step in common_steps]
         train_delta = [cand_by_step[step]["train_loss"] - base_by_step[step]["train_loss"] for step in common_steps]
@@ -171,7 +215,7 @@ def plot_losses(out_dir, baseline_name, candidate_name, baseline, candidate):
         plt.plot(common_steps, val_delta, marker="o", label="val delta")
         plt.xlabel("step")
         plt.ylabel("candidate loss - baseline loss")
-        plt.title("Loss delta (negative means candidate is better)")
+        plt.title(f"Loss delta from step {delta_min_step} (negative means candidate is better)")
         plt.grid(True, alpha=0.3)
         plt.legend()
         plt.tight_layout()
@@ -196,8 +240,8 @@ def plot_losses(out_dir, baseline_name, candidate_name, baseline, candidate):
 
 def main():
     parser = argparse.ArgumentParser(description="Compare two nanoGPT training logs.")
-    parser.add_argument("--baseline-log", required=True)
-    parser.add_argument("--candidate-log", required=True)
+    parser.add_argument("--baseline-log", action="append", required=True)
+    parser.add_argument("--candidate-log", action="append", required=True)
     parser.add_argument("--baseline-name", default="original")
     parser.add_argument("--candidate-name", default="modern_v1")
     parser.add_argument("--out-dir", required=True)
@@ -206,8 +250,8 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    baseline = parse_log(args.baseline_log)
-    candidate = parse_log(args.candidate_log)
+    baseline = parse_logs([Path(path) for path in args.baseline_log])
+    candidate = parse_logs([Path(path) for path in args.candidate_log])
     write_summary(out_dir, args.baseline_name, args.candidate_name, baseline, candidate)
     try:
         plot_losses(out_dir, args.baseline_name, args.candidate_name, baseline, candidate)
