@@ -1,11 +1,16 @@
 import argparse
 import os
 import pickle
+import sys
 import time
 from contextlib import nullcontext
 from pathlib import Path
 
 import torch
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from model import GPTConfig, GPT
 
