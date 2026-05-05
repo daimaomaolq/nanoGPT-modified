@@ -41,10 +41,13 @@ def build_codec(checkpoint):
     if load_meta:
         with open(meta_path, "rb") as f:
             meta = pickle.load(f)
-        stoi, itos = meta["stoi"], meta["itos"]
-        encode = lambda s: [stoi[c] for c in s]
-        decode = lambda l: "".join([itos[i] for i in l])
-    else:
+        if "stoi" in meta and "itos" in meta:
+            stoi, itos = meta["stoi"], meta["itos"]
+            encode = lambda s: [stoi[c] for c in s]
+            decode = lambda l: "".join([itos[i] for i in l])
+        else:
+            load_meta = False
+    if not load_meta:
         import tiktoken
         enc = tiktoken.get_encoding("gpt2")
         encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
