@@ -16,7 +16,11 @@ def response_mask_from_prompt_lengths(sequences: torch.Tensor, prompt_lengths, p
 def token_logprobs(model, sequences: torch.Tensor, response_mask: torch.Tensor):
     idx = sequences[:, :-1]
     targets = sequences[:, 1:]
-    logits, _ = model(idx)
+    lm_targets = targets.masked_fill(~response_mask, -1)
+    # Passing targets keeps nanoGPT on the full-sequence logits path. With
+    # targets=None the model optimizes inference by returning only the last
+    # position, which is not enough for response-token policy gradients.
+    logits, _ = model(idx, lm_targets)
     log_probs = F.log_softmax(logits, dim=-1)
     gathered = torch.gather(log_probs, dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
     gathered = gathered * response_mask.to(gathered.dtype)
